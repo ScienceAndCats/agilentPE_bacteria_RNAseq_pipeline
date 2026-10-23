@@ -20,7 +20,8 @@ class SlurmWorkflowTests(unittest.TestCase):
         self.config = self.base / 'original.env'
         self.config.write_text('# source settings\n')
         for name in ('zebra', 'alpha'):
-            (self.reads / f'{name}.fastq').write_text('@read\nACGT\n+\nIIII\n')
+            for mate in (1, 2):
+                (self.reads / f'{name}_R{mate}.fastq').write_text('@read\nACGT\n+\nIIII\n')
         self.environment = {
             'FASTQ_DIR': str(self.reads), 'OUTPUT_DIR': str(self.output),
             'DECOY_REFERENCE_DIR': str(self.base / 'decoy'),
@@ -34,10 +35,10 @@ class SlurmWorkflowTests(unittest.TestCase):
         return workflow.create_plan(self.config, self.base, dict(self.environment, **overrides))
 
     def test_freezes_sorted_samples_resolved_settings_and_unique_runs(self):
-        path, plan = self.plan(THREADS='3', ADAPTER_SEQUENCE='legacy adapter')
+        path, plan = self.plan(THREADS='3', ADAPTER_R1='paired adapter')
         frozen = Path(plan['frozen_config']).read_text()
-        self.assertIn('ADAPTER_SEQUENCE=', frozen)
-        self.assertIn('legacy adapter', frozen)
+        self.assertIn('ADAPTER_R1=', frozen)
+        self.assertIn('paired adapter', frozen)
         self.assertIn('THREADS=3', frozen)
         self.assertEqual([s['sample'] for s in plan['samples']], ['alpha', 'zebra'])
         self.assertTrue(Path(plan['samples'][0]['output_dir']).is_dir())
@@ -46,15 +47,28 @@ class SlurmWorkflowTests(unittest.TestCase):
         self.assertEqual(plan['array_concurrency'], 8)
         self.assertEqual(json.loads(path.read_text()), plan)
         self.config.write_text('OUTPUT_DIR=changed\n')
-        (self.reads / 'new.fastq').write_text('')
+        for mate in (1, 2):
+            (self.reads / f'new_R{mate}.fastq').write_text('')
         self.assertEqual(len(json.loads(Path(plan['sample_manifest']).read_text())['samples']), 2)
         _, second = self.plan()
         self.assertNotEqual(plan['run_dir'], second['run_dir'])
         self.assertEqual(frozen, Path(plan['frozen_config']).read_text())
 
+    def test_frozen_config_contains_paired_settings_and_mbc_counting(self):
+        _, plan = self.plan(MBC_MODE='count', ADAPTER_R1='adapter one', ADAPTER_R2='adapter two')
+        frozen = Path(plan['frozen_config']).read_text()
+        self.assertEqual(plan['read_layout'], 'paired')
+        self.assertEqual(plan['mbc'], {'mode': 'count', 'input': 'raw'})
+        self.assertIn('MBC_MODE=count\n', frozen)
+        self.assertIn('MBC_INPUT=raw\n', frozen)
+        self.assertIn('COUNT_STRAND=reverse\n', frozen)
+        self.assertNotIn('READ_LAYOUT=', frozen)
+        self.assertNotIn('ADAPTER_SINGLE=', frozen)
+
     def test_default_rejects_more_than_40_without_silent_truncation(self):
         for index in range(39):
-            (self.reads / f'extra_{index}.fastq').write_text('')
+            for mate in (1, 2):
+                (self.reads / f'extra_{index}_R{mate}.fastq').write_text('')
         with self.assertRaises(ValueError):
             self.plan()
         self.assertFalse(self.output.exists())
@@ -62,7 +76,7 @@ class SlurmWorkflowTests(unittest.TestCase):
         self.assertEqual(len(plan['samples']), 41)
 
     def test_rejects_invalid_limits_and_path_controls(self):
-        for changes in ({'MAX_SAMPLES': '0'}, {'ARRAY_CONCURRENCY': '-1'}, {'THREADS': 'nan'}, {'OUTPUT_DIR': 'bad\nname'}):
+        for changes in ({'MAX_SAMPLES': '0'}, {'ARRAY_CONCURRENCY': '-1'}, {'THREADS': 'nan'}, {'OUTPUT_DIR': 'bad\nname'}, {'COUNT_STRAND': 'forward'}, {'MBC_MODE': 'invalid'}, {'MBC_INPUT': 'invalid'}, {'MBC_MODE': 'count', 'MBC_INPUT': 'trimmed'}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self.plan(**changes)
 
@@ -156,7 +170,7 @@ class SlurmWorkflowTests(unittest.TestCase):
         plans = list(self.output.glob('slurm_runs/*/plan.json'))
         self.assertEqual(len(plans), 1)
         plan = json.loads(plans[0].read_text())
-        self.assertEqual(plan['samples'][0]['read1'], str(self.reads / 'alpha.fastq'))
+        self.assertEqual(plan['samples'][0]['read1'], str(self.reads / 'alpha_R1.fastq'))
         self.assertEqual(plan['slurm_account'], 'research_lab')
         self.assertEqual(plan['slurm_mail_user'], 'researcher@example.org')
         commands = [line for line in result.stdout.splitlines() if line.startswith('sbatch ')]
@@ -182,16 +196,16 @@ class SlurmWorkflowTests(unittest.TestCase):
         for index, sample in enumerate(plan['samples']):
             directory = Path(sample['output_dir'])
             files = {}
-            for name in ('trim.log', 'decoy.log', 'dna.log', 'categories.json', 'coverage.tsv', 'leftover.fastq.gz'):
+            for name in ('trim.log', 'decoy.log', 'dna.log', 'categories.json', 'coverage.tsv', 'leftover_1.fastq.gz', 'leftover_2.fastq.gz', 'mbc_prepare.json', 'decoy.molecules.bam', 'decoy.mbc_dedup.json', 'dna.molecules.bam', 'dna.mbc_dedup.json', 'dna.molecules.categories.json'):
                 path = directory / name
                 path.write_text('report')
                 files[name] = str(path)
             worker = {
-                'read_layout': plan['read_layout'], 'sample_index': index,
+                'read_layout': plan['read_layout'], 'mbc': plan['mbc'], 'sample_index': index,
                 'input_sample_manifest': plan['sample_manifest'], 'samples': [{
-                    'sample': sample['sample'], 'cutadapt_log': files['trim.log'],
-                    'stages': [{'name': 'decoy', 'organism': 'decoy', 'kind': 'decoy', 'log': files['decoy.log']}, {'name': 'bacteria_dna', 'organism': 'bacteria', 'kind': 'dna', 'log': files['dna.log'], 'categories': files['categories.json'], 'coverage': files['coverage.tsv']}],
-                    'leftover': [files['leftover.fastq.gz']],
+                    'sample': sample['sample'], 'cutadapt_log': files['trim.log'], 'mbc_prepare': files['mbc_prepare.json'],
+                    'stages': [{'name': 'decoy', 'organism': 'decoy', 'kind': 'decoy', 'log': files['decoy.log'], 'molecules': files['decoy.molecules.bam'], 'mbc_stats': files['decoy.mbc_dedup.json']}, {'name': 'bacteria_dna', 'organism': 'bacteria', 'kind': 'dna', 'log': files['dna.log'], 'categories': files['categories.json'], 'coverage': files['coverage.tsv'], 'molecules': files['dna.molecules.bam'], 'mbc_stats': files['dna.mbc_dedup.json'], 'molecule_categories': files['dna.molecules.categories.json']}],
+                    'leftover': [files['leftover_1.fastq.gz'], files['leftover_2.fastq.gz']],
                 }],
             }
             (directory / 'run_manifest.json').write_text(json.dumps(worker))
@@ -232,6 +246,38 @@ class SlurmWorkflowTests(unittest.TestCase):
         Path(str(table) + '.summary').unlink()
         with self.assertRaisesRegex(ValueError, 'featureCounts output'):
             workflow.validate_gene_tables(plan)
+
+    def test_count_mode_requires_molecule_bams_stats_and_categories(self):
+        _, plan = self.plan(MBC_MODE='count')
+        for missing in ('decoy.molecules.bam', 'decoy.mbc_dedup.json', 'dna.molecules.categories.json', 'mbc_prepare.json'):
+            with self.subTest(missing=missing):
+                self.worker_manifests(plan)
+                workflow.collect_samples(plan)
+                (Path(plan['samples'][0]['output_dir']) / missing).unlink()
+                with self.assertRaisesRegex(ValueError, 'Missing'):
+                    workflow.collect_samples(plan)
+
+    def test_count_mode_requires_molecule_tables_even_when_every_worker_lost_them(self):
+        _, plan = self.plan(MBC_MODE='count')
+        self.worker_manifests(plan)
+        gff = Path(plan['run_dir']) / 'genes.gff'
+        gff.write_text('chr\ttest\tCDS\t1\t100\t.\t+\t.\tlocus_tag=g1\n')
+        references = json.loads(Path(plan['reference_manifest']).read_text())
+        references['bacteria']['dna']['gff'] = str(gff)
+        Path(plan['reference_manifest']).write_text(json.dumps(references))
+        for sample in plan['samples']:
+            table = Path(sample['output_dir']) / 'featurecounts_BACTERIA_summary.txt'
+            table.write_text('table')
+            Path(str(table) + '.summary').write_text('summary')
+        with self.assertRaisesRegex(ValueError, 'molecule_counts'):
+            workflow.validate_gene_tables(plan)
+        for sample in plan['samples']:
+            directory = Path(sample['output_dir']) / 'molecule_counts'
+            directory.mkdir()
+            table = directory / 'featurecounts_BACTERIA_summary.txt'
+            table.write_text('table')
+            Path(str(table) + '.summary').write_text('summary')
+        workflow.validate_gene_tables(plan)
 
     def test_failed_finalization_preserves_last_successful_reports(self):
         _, plan = self.plan()

@@ -95,25 +95,28 @@ class PipelineIntegrationTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.temporary.cleanup()
 
-    def run_pipeline(self, name, layout="single", host=True, rerun=False, inputs=None):
+    def run_pipeline(self, name, host=True, rerun=False, inputs=None, mbc_mode="strip"):
         inputs = self.inputs if inputs is None else inputs
         directory = self.base / name
         reads = directory / "input reads"
         reads.mkdir(parents=True, exist_ok=True)
-        for mate in ((1, 2) if layout == "paired" else (1,)):
+        for mate in (1, 2):
             text = []
-            for ident, sequence, start in inputs:
-                offset = start if mate == 1 else start + 160
+            for entry in inputs:
+                ident, sequence, start = entry[:3]
+                offset = start + 160 if mate == 1 else start
                 bases = sequence[offset:offset + 100]
                 self.assertEqual(len(bases), 100)
-                if mate == 2:
+                if mate == 1:
                     bases = str(Seq(bases).reverse_complement())
-                text.append(f"@{ident}\n{bases}\n+\n{'I' * 100}\n")
-            filename = f"sample_R{mate}.fastq.gz" if layout == "paired" else "sample.fastq.gz"
+                barcode = entry[3 if mate == 1 else 4] if len(entry) == 5 else ("AAA" if mate == 1 else "CCC")
+                bases = barcode + "GT" + bases
+                text.append(f"@{ident}\n{bases}\n+\n{'I' * len(bases)}\n")
+            filename = f"sample_R{mate}.fastq.gz"
             gzwrite(reads / filename, "".join(text))
         output = directory / "analysis output"
         config = directory / "run.env"
-        settings = {"FASTQ_DIR": str(reads), "FASTQ_GLOB": "*.fastq.gz", "READ_LAYOUT": layout, "OUTPUT_DIR": str(output), "DECOY_REFERENCE_DIR": str(self.references / "decoy"), "BACTERIA_REFERENCE_DIR": str(self.references / "PAO1"), "HOST_REFERENCE_DIR": str(self.references / "human") if host else "", "REFERENCE_CACHE_DIR": str(self.cache), "THREADS": "2", "COUNT_STRAND": "forward", "GENE_POSITION_BINS": "5", "METAGENE_MIN_FEATURE_READS": "1", "SAMPLE_READS": "true", "SAMPLE_SIZE": str(len(inputs)), "SAMPLE_SEED": "17"}
+        settings = {"FASTQ_DIR": str(reads), "FASTQ_GLOB": "*.fastq.gz", "OUTPUT_DIR": str(output), "DECOY_REFERENCE_DIR": str(self.references / "decoy"), "BACTERIA_REFERENCE_DIR": str(self.references / "PAO1"), "HOST_REFERENCE_DIR": str(self.references / "human") if host else "", "REFERENCE_CACHE_DIR": str(self.cache), "THREADS": "2", "COUNT_STRAND": "reverse", "GENE_POSITION_BINS": "5", "METAGENE_MIN_FEATURE_READS": "1", "SAMPLE_READS": "true", "SAMPLE_SIZE": str(len(inputs)), "SAMPLE_SEED": "17", "MBC_MODE": mbc_mode, "MBC_INPUT": "raw"}
         config.write_text("".join(f"{key}={shlex.quote(value)}\n" for key, value in settings.items()))
         log_path = directory / ("rerun.log" if rerun else "pipeline.log")
         env = dict(os.environ, MPLBACKEND="Agg", MPLCONFIGDIR=str(self.base / "matplotlib"))
@@ -162,36 +165,37 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(manifest["decoy"]["index"], str(self.references / "decoy/Gina_Pangenome"))
         self.assertEqual(self.original_files, self.reference_snapshot(), "reference files must remain untouched")
 
-    def exercise_array_workers(self, layout):
+    def exercise_array_workers(self, mbc_mode="strip"):
         # Execute the actual scheduler entry points locally; no Slurm service is
         # required to exercise worker isolation and the dependent final report.
         sys.path.insert(0, str(REPOSITORY))
         from slurm_workflow import create_plan
-        directory = self.base / (f"array workers {layout}" + (" % parent" if layout == "paired" else ""))
+        directory = self.base / f"array workers % parent {mbc_mode}"
         reads = directory / "input reads"
         reads.mkdir(parents=True)
-        names = ["alpha 'first" + (" %" if layout == "paired" else ""), "zeta"]
+        names = ["alpha 'first %", "zeta"]
         for name in names:
-            for mate in ((1, 2) if layout == "paired" else (1,)):
+            for mate in (1, 2):
                 records = []
                 for ident, sequence, start in self.inputs:
-                    offset = start if mate == 1 else start + 160
+                    offset = start + 160 if mate == 1 else start
                     bases = sequence[offset:offset + 100]
-                    if mate == 2:
+                    if mate == 1:
                         bases = str(Seq(bases).reverse_complement())
-                    records.append(f"@{ident}\n{bases}\n+\n{'I' * 100}\n")
-                filename = f"{name}_R{mate}.fastq.gz" if layout == "paired" else f"{name}.fastq.gz"
+                    bases = ("AAA" if mate == 1 else "CCC") + "GT" + bases
+                    records.append(f"@{ident}\n{bases}\n+\n{'I' * len(bases)}\n")
+                filename = f"{name}_R{mate}.fastq.gz"
                 gzwrite(reads / filename, "".join(records))
         output = directory / "project output"
         config = directory / "source config.env"
         settings = {
-            "FASTQ_DIR": str(reads), "FASTQ_GLOB": "*.fastq.gz", "READ_LAYOUT": layout,
+            "FASTQ_DIR": str(reads), "FASTQ_GLOB": "*.fastq.gz",
             "OUTPUT_DIR": str(output), "DECOY_REFERENCE_DIR": str(self.references / "decoy"),
             "BACTERIA_REFERENCE_DIR": str(self.references / "PAO1"),
             "HOST_REFERENCE_DIR": str(self.references / "human"),
-            "REFERENCE_CACHE_DIR": str(self.cache), "THREADS": "2", "COUNT_STRAND": "forward",
+            "REFERENCE_CACHE_DIR": str(self.cache), "THREADS": "2", "COUNT_STRAND": "reverse",
             "GENE_POSITION_BINS": "5", "METAGENE_MIN_FEATURE_READS": "1",
-            "SAMPLE_READS": "false", "CONDA_ENV": "",
+            "SAMPLE_READS": "false", "CONDA_ENV": "", "MBC_MODE": mbc_mode, "MBC_INPUT": "raw",
         }
         config.write_text("".join(f"{k}={shlex.quote(v)}\n" for k, v in settings.items()))
         plan_path, plan = create_plan(config, REPOSITORY, settings)
@@ -268,6 +272,15 @@ class PipelineIntegrationTests(unittest.TestCase):
                         csv_rows = list(csv.reader(line for line in handle if not line.startswith("#")))
                     self.assertEqual(csv_rows, matrix)
                     merged_files.append(csv_table)
+        if mbc_mode == "count":
+            for table in merged_files:
+                if table.suffix == ".txt" and not str(table).endswith(".summary"):
+                    molecular = output / "molecule_counts" / table.relative_to(output)
+                    self.assertTrue(molecular.exists())
+                    with molecular.open() as handle:
+                        matrix = list(csv.reader((line for line in handle if not line.startswith("#")), delimiter="\t"))
+                    self.assertEqual(len(matrix[0]), 8)
+                    self.assertTrue(all(column.endswith(".molecules.bam") for column in matrix[0][6:]))
         # Missing or stale worker output must not replace successful reports
         # or any previously published gene matrices/assignment summaries.
         successful_outputs = {path: path.read_bytes() for path in merged_files + [output / "output_read_breakdown.csv"]}
@@ -310,23 +323,23 @@ class PipelineIntegrationTests(unittest.TestCase):
         stage("sample", index=2, expect_success=False)
         self.assertEqual(self.original_files, self.reference_snapshot())
 
-    def test_two_single_end_array_workers_and_combined_reports(self):
-        self.exercise_array_workers("single")
-
     def test_two_paired_end_array_workers_and_combined_reports(self):
-        self.exercise_array_workers("paired")
+        self.exercise_array_workers()
 
-    def test_single_end_host_rna_priority_and_cache_reuse(self):
-        output, row = self.run_pipeline("single host")
+    def test_molecule_array_workers_and_combined_reports(self):
+        self.exercise_array_workers("count")
+
+    def test_host_rna_priority_and_cache_reuse(self):
+        output, row = self.run_pipeline("paired cache host")
         self.assert_outputs(output, row)
         indices = {p: p.stat().st_mtime_ns for p in self.cache.rglob("*.bt2")}
         self.assertTrue(indices)
-        output, row = self.run_pipeline("single host", rerun=True)
+        output, row = self.run_pipeline("paired cache host", rerun=True)
         self.assert_outputs(output, row)
         self.assertEqual(indices, {p: p.stat().st_mtime_ns for p in self.cache.rglob("*.bt2")})
 
     def test_paired_end_counts_fragments_once(self):
-        output, row = self.run_pipeline("paired host", layout="paired")
+        output, row = self.run_pipeline("paired host")
         self.assert_outputs(output, row)
 
     def test_all_reads_consumed_by_rna_keep_empty_dna_stages_valid(self):
@@ -346,8 +359,38 @@ class PipelineIntegrationTests(unittest.TestCase):
             with gzip.open(path, "rt") as handle:
                 self.assertEqual(handle.read(), "")
 
+    def test_mbc_count_collapses_pcr_duplicates_but_keeps_distinct_captures(self):
+        sequence = self.transcripts["bacteria"]["coding"]
+        inputs = [("PCR1", sequence, 250, "AAA", "CCC"),
+                  ("PCR2", sequence, 250, "AAA", "CCC"),
+                  ("different_MBC", sequence, 250, "AAT", "CCC"),
+                  ("different_position", sequence, 260, "AAA", "CCC")]
+        output, row = self.run_pipeline("molecule captures", inputs=inputs, mbc_mode="count")
+        self.assertEqual(int(row["Total reads (reads)"]), 4)
+        self.assertEqual(int(row["Bacteria CDS (reads)"]), 4)
+        stage = next(stage for stage in json.loads((output / "run_manifest.json").read_text())["samples"][0]["stages"] if stage["name"] == "bacteria_rna")
+        self.assertEqual(json.loads(Path(stage["mbc_stats"]).read_text())["molecules"], 3)
+        self.assertEqual(json.loads(Path(stage["molecule_categories"]).read_text())["categories"]["CDS"], 3)
+        def total(table):
+            with table.open() as handle:
+                rows = list(csv.reader((line for line in handle if not line.startswith("#")), delimiter="\t"))
+            return sum(int(row[6]) for row in rows[1:])
+        relative = Path("bowtie_alignments/bacteria/rna/featurecounts_BACTERIA_summary.txt")
+        self.assertEqual(total(output / relative), 4)
+        self.assertEqual(total(output / "molecule_counts" / relative), 3)
+        # Switching off molecular counting must not leave stale gene matrices
+        # looking like the new run's results in the same output directory.
+        config = output.parent / "run.env"
+        config.write_text(config.read_text().replace("MBC_MODE=count", "MBC_MODE=strip"))
+        result = subprocess.run(["bash", str(REPOSITORY / "map_bacteria_with_decoys.sh"), str(config)],
+                                cwd=REPOSITORY, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("choose a new OUTPUT_DIR", result.stderr)
+        self.assertEqual(total(output / "molecule_counts" / relative), 3)
+
+
     def test_no_host_classifies_shared_dna_and_keeps_host_reads(self):
-        output, row = self.run_pipeline("single no host", host=False)
+        output, row = self.run_pipeline("paired no host", host=False)
         self.assert_outputs(output, row, host=False)
 
 

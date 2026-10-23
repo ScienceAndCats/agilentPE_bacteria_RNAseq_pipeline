@@ -38,16 +38,16 @@ def report_number(report, pattern, path):
 def cutadapt_counts(path):
     report = path.read_text()
     total = report_number(
-        report, r"Total (?:read pairs|reads) processed:\s*([\d,]+)", path
+        report, r"Total read pairs processed:\s*([\d,]+)", path
     )
     passing = report_number(
-        report, r"(?:Pairs|Reads) written \(passing filters\):\s*([\d,]+)", path
+        report, r"Pairs written \(passing filters\):\s*([\d,]+)", path
     )
     return total, passing
 
 
 def bowtie_counts(path):
-    """Return input and aligned read/read-pair counts from a Bowtie2 report."""
+    """Return input and aligned read-pair counts from a Bowtie2 report."""
     report = path.read_text()
     # Bowtie2 omits the detailed hierarchy when its input FASTQ is empty.
     # Its CPU-dispatch wrapper may prefix warning lines even for valid runs.
@@ -55,14 +55,11 @@ def bowtie_counts(path):
     if re.fullmatch(r"\s*0 reads\s*\n0\.00% overall alignment rate\s*", count_report):
         return 0, 0
     total = report_number(report, r"^\s*([\d,]+) reads; of these:", path)
-    if "were paired; of these:" in report:
-        unaligned = report_number(
-            report, r"^\s*([\d,]+) \([^\n]+\) aligned concordantly 0 times$", path
-        )
-    else:
-        unaligned = report_number(
-            report, r"^\s*([\d,]+) \([^\n]+\) aligned 0 times$", path
-        )
+    if "were paired; of these:" not in report:
+        raise ValueError(f"Expected a paired-end Bowtie2 report: {path}")
+    unaligned = report_number(
+        report, r"^\s*([\d,]+) \([^\n]+\) aligned concordantly 0 times$", path
+    )
     return total, total - unaligned
 
 
@@ -145,8 +142,8 @@ def build_legacy_table(output_dir):
             "Leftover reads": passing - decoy_aligned - bacteria_aligned - host_aligned,
         }
         sources = {
-            "Total reads": f"{cutadapt_path.name}: Total reads/read pairs processed",
-            "Reads passing cutadapt length filter": f"{cutadapt_path.name}: Reads/pairs written (passing filters)",
+            "Total reads": f"{cutadapt_path.name}: Total read pairs processed",
+            "Reads passing cutadapt length filter": f"{cutadapt_path.name}: Pairs written (passing filters)",
             "Decoy aligned": f"{decoy_path.relative_to(output_dir)}: input minus aligned 0 times",
             "Bacteria aligned": f"{bacteria_path.relative_to(output_dir)}: input minus aligned 0 times",
             "Bacteria rRNA": f"{bacteria_rrna_path.relative_to(output_dir)}: Assigned",
@@ -215,8 +212,8 @@ def build_manifest_table(output_dir):
         sources = {attribute: "Host alignment not configured" for attribute in ATTRIBUTES}
         counts["Total reads"], counts["Reads passing cutadapt length filter"] = total, passing
         cutadapt_source = source_path(output_dir, cutadapt_path)
-        sources["Total reads"] = f"{cutadapt_source}: Total reads/read pairs processed"
-        sources["Reads passing cutadapt length filter"] = f"{cutadapt_source}: Reads/pairs written (passing filters)"
+        sources["Total reads"] = f"{cutadapt_source}: Total read pairs processed"
+        sources["Reads passing cutadapt length filter"] = f"{cutadapt_source}: Pairs written (passing filters)"
         remaining = passing
         logs = {"bacteria": [], "host": []}
         categories = {"bacteria": [], "host": []}
@@ -270,7 +267,7 @@ def build_manifest_table(output_dir):
             label = organism.title()
             counts[f"{label} non-rRNA"] = counts[f"{label} aligned"] - counts[f"{label} rRNA"]
             if logs[organism]:
-                sources[f"{label} aligned"] = "; ".join(logs[organism]) + ": RNA + DNA aligned reads/read pairs"
+                sources[f"{label} aligned"] = "; ".join(logs[organism]) + ": RNA + DNA aligned read pairs"
                 for category_label in CATEGORY_LABELS.values():
                     sources[f"{label} {category_label}"] = "; ".join(categories[organism]) + ": mutually exclusive annotation category"
                 sources[f"{label} non-rRNA"] = f"Calculated: {label} aligned minus {label} rRNA"

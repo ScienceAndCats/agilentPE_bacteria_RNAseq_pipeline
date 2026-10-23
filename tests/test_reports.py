@@ -18,10 +18,9 @@ class ReportTests(unittest.TestCase):
         self.output = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
 
-    def fixture(self, paired=False):
+    def fixture(self):
         (self.output / 'cutadapt.txt').write_text(
-            'Total read pairs processed: 20\nPairs written (passing filters): 18\n' if paired else
-            'Total reads processed: 20\nReads written (passing filters): 18\n')
+            'Total read pairs processed: 20\nPairs written (passing filters): 18\n')
         specs = [
             ('decoy', 'decoy', 'decoy', 2, None),
             ('bacteria_rna', 'bacteria', 'rna', 5, [1, 3, 1, 0]),
@@ -31,10 +30,7 @@ class ReportTests(unittest.TestCase):
         ]
         remaining, stages = 18, []
         for name, organism, kind, aligned, categories in specs:
-            if paired:
-                log = f'{remaining} reads; of these:\n  {remaining} (100.00%) were paired; of these:\n    {remaining-aligned} (0.00%) aligned concordantly 0 times\n'
-            else:
-                log = f'{remaining} reads; of these:\n  {remaining} (100.00%) were unpaired; of these:\n    {remaining-aligned} (0.00%) aligned 0 times\n'
+            log = f'{remaining} reads; of these:\n  {remaining} (100.00%) were paired; of these:\n    {remaining-aligned} (0.00%) aligned concordantly 0 times\n'
             (self.output / f'{name}.log').write_text(log)
             stage = dict(name=name, organism=organism, kind=kind, log=f'{name}.log')
             if categories is not None:
@@ -65,7 +61,13 @@ class ReportTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bowtie_counts(path)
 
-    def test_single_read_categories_conserve_input(self):
+    def test_unpaired_bowtie_report_is_rejected(self):
+        path = self.output / 'unpaired.log'
+        path.write_text('10 reads; of these:\n  10 (100.00%) were unpaired; of these:\n    2 (20.00%) aligned 0 times\n')
+        with self.assertRaisesRegex(ValueError, 'paired-end'):
+            bowtie_counts(path)
+
+    def test_paired_categories_conserve_input(self):
         self.fixture()
         sample, counts, sources = build_table(self.output)[0]
         self.assertEqual(sample, 'sample')
@@ -78,7 +80,7 @@ class ReportTests(unittest.TestCase):
         self.assertIn('bacteria_dna.json', sources['Bacteria CDS'])
 
     def test_pairs_counted_as_pairs_in_reports(self):
-        self.fixture(paired=True)
+        self.fixture()
         _, counts, _ = build_table(self.output)[0]
         self.assertEqual(counts['Bacteria aligned'], 9)
         self.assertEqual(counts['Total reads'], 20)
@@ -140,7 +142,7 @@ class ReportTests(unittest.TestCase):
         manifest = self.fixture()
         stages = manifest['samples'][0]['stages']
         manifest['samples'][0]['stages'] = [stage for stage in stages if stage['organism'] != 'host']
-        (self.output / 'bacteria_dna.log').write_text('11 reads; of these:\n  7 (63.64%) aligned 0 times\n')
+        (self.output / 'bacteria_dna.log').write_text('11 reads; of these:\n  11 (100.00%) were paired; of these:\n    7 (63.64%) aligned concordantly 0 times\n')
         self.save_manifest(manifest)
         _, counts, sources = build_table(self.output)[0]
         self.assertEqual(counts['Host aligned'], 0)
