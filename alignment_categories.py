@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Count mutually exclusive annotation categories for mapped reads or proper pairs.
+"""Count mutually exclusive annotation categories for reverse-stranded proper pairs.
 
 Inputs must group paired primary alignments by query name (Bowtie2 --reorder).
 Coordinates come from aligned CIGAR blocks, never the unsequenced fragment span.
@@ -149,7 +149,7 @@ class AnnotationIndex:
         return "intergenic_unannotated", set()
 
 
-def classify_alignments(sam, gff, paired=False, strand="forward", reference_kind="dna"):
+def classify_alignments(sam, gff, reference_kind="dna"):
     annotation = AnnotationIndex(gff, reference_kind)
     counts = dict.fromkeys(CATEGORIES, 0)
     features = set()
@@ -161,9 +161,9 @@ def classify_alignments(sam, gff, paired=False, strand="forward", reference_kind
         reference = first.reference_name
         if any(read.reference_name != reference for read in reads):
             raise ValueError(f"Proper pair has different reference names: {first.query_name}")
-        selected_strand = None if strand == "unstranded" else ("-" if first.is_reverse else "+")
-        if strand == "reverse":
-            selected_strand = "+" if selected_strand == "-" else "-"
+        # SureSelect Max RNA libraries: R1 is antisense and R2 is sense.
+        # reads[0] is R1, so the annotated transcript has the opposite strand.
+        selected_strand = "+" if first.is_reverse else "-"
         blocks = [block for read in reads for block in read.get_blocks() if block[0] < block[1]]
         category, matched_features = annotation.classify(reference, blocks, selected_strand)
         counts[category] += 1
@@ -181,10 +181,8 @@ def classify_alignments(sam, gff, paired=False, strand="forward", reference_kind
             raise ValueError(f"GFF coordinates exceed SAM reference lengths: {', '.join(sorted(too_short)[:10])}")
         for query_name, group in groupby(handle, key=lambda read: read.query_name):
             primary = [read for read in group if not (read.is_unmapped or read.is_secondary or read.is_supplementary)]
-            if not paired:
-                for read in primary:
-                    add([read])
-                continue
+            if any(not read.is_paired for read in primary):
+                raise ValueError(f"Unpaired alignment in paired-end input: {query_name}")
             proper = [read for read in primary if read.is_proper_pair and not read.mate_is_unmapped]
             if not proper:
                 continue
@@ -200,12 +198,10 @@ def main():
     parser.add_argument("--sam", required=True, type=Path)
     parser.add_argument("--gff", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
-    parser.add_argument("--paired", action="store_true")
-    parser.add_argument("--strand", choices=("forward", "reverse", "unstranded"), default="forward")
     parser.add_argument("--reference-kind", choices=("rna", "dna"), default="dna")
     args = parser.parse_args()
     try:
-        result = classify_alignments(args.sam, args.gff, args.paired, args.strand, args.reference_kind)
+        result = classify_alignments(args.sam, args.gff, args.reference_kind)
     except (ValueError, OSError) as exc:
         parser.exit(1, f"ERROR: {exc}\n")
     args.output.write_text(json.dumps(result, indent=2) + "\n")

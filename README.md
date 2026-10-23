@@ -1,6 +1,6 @@
 # Bacterial RNA-seq pipeline
 
-Trim single- or paired-end FASTQ reads, remove decoy alignments, align to bacterial and optional host RNA **before genomic DNA**, and report the disposition of every passing read or read pair.
+Trim paired-end FASTQ reads, remove decoy alignments, align to bacterial and optional host RNA **before genomic DNA**, and report the disposition of every passing read pair.
 
 ## Install and run
 
@@ -18,19 +18,18 @@ Copy `config.env` for each project and set the reference **folders**, rather tha
 FASTQ_DIR="/path/to/fastqs"
 FASTQ_GLOB="*.fastq.gz"
 OUTPUT_DIR="/path/to/results"
-READ_LAYOUT="paired"
 DECOY_REFERENCE_DIR="/path/to/referencegenomes/decoy"
 BACTERIA_REFERENCE_DIR="/path/to/referencegenomes/PAO1"
 HOST_REFERENCE_DIR="/path/to/referencegenomes/human"  # or mouse; empty disables host
 THREADS="4"
-COUNT_STRAND="forward"
+COUNT_STRAND="reverse"
 ```
 
 Run the copied config with `bash map_bacteria_with_decoys.sh /path/to/project.env`. Relative paths in a config are resolved from the directory where you launch the command. References are read only; index building requires space in the cache, not write access to the reference folders.
 
 ## Run on Slurm: one sample per array task
 
-Keep `FASTQ_DIR`, `READ_LAYOUT`, references, and output settings in the same project config. You do not need to list individual FASTQs or calculate array indices. The defaults are:
+Keep `FASTQ_DIR`, references, and output settings in the same project config. You do not need to list individual FASTQs or calculate array indices. The defaults are:
 
 ```bash
 MAX_SAMPLES="40"
@@ -38,7 +37,7 @@ ARRAY_CONCURRENCY="8"
 THREADS="16"
 ```
 
-One SE FASTQ is one sample; an R1/R2 pair is one sample. The discovered sample list is sorted and frozen before submission. `MAX_SAMPLES` is a submission limit, not a sampling limit: a folder containing more than 40 samples produces an error rather than dropping files. Increase it explicitly for a larger project. `ARRAY_CONCURRENCY` limits active sample tasks independently of the total sample count.
+An R1/R2 pair is one sample. The discovered sample list is sorted and frozen before submission. `MAX_SAMPLES` is a submission limit, not a sampling limit: a folder containing more than 40 samples produces an error rather than dropping files. Increase it explicitly for a larger project. `ARRAY_CONCURRENCY` limits active sample tasks independently of the total sample count.
 
 Set your cluster account and notification email in the project config; no edits to the Slurm scripts are needed:
 
@@ -69,7 +68,7 @@ bash submit_bacteria_pipeline.sh /path/to/project.env
 Do not submit the array template directly; the helper determines the exact array range and automatically queues:
 
 1. **Preparation job:** build or reuse shared reference indices once.
-2. **Sample array:** `0-(sample_count-1)%8` by default, dependent on successful preparation. Each task uses `SLURM_ARRAY_TASK_ID` to select one SE file or PE pair from the frozen manifest. Its files, sampled reads, alignment outputs, and gene counts go to an isolated sample directory.
+2. **Sample array:** `0-(sample_count-1)%8` by default, dependent on successful preparation. Each task uses `SLURM_ARRAY_TASK_ID` to select one R1/R2 pair from the frozen manifest. Its files, sampled reads, alignment outputs, and gene counts go to an isolated sample directory.
 3. **Final reporting job:** dependent on successful completion of the **entire** array. It verifies that every expected sample completed, merges the sample manifests and gene-count tables, and writes the project summary and read-breakdown CSVs using all samples. A failed or missing task prevents incomplete project reports from being published.
 
 Submission prints all three job IDs and the run-plan path. `bash submit_bacteria_pipeline.sh /path/to/project.env --dry-run` freezes the plan and prints the submission commands without queuing any jobs.
@@ -123,7 +122,7 @@ trim → decoy → bacterial RNA → host RNA → bacterial DNA → host DNA →
 
 Host stages are omitted when `HOST_REFERENCE_DIR=""`. At each step, only reads that failed the previous alignment continue. This gives RNA references priority across both organisms. When sequences are shared, the first successful stage owns the read; bacteria precede host within the same reference kind. Bowtie2 reports one primary alignment per read, including multimapping reads; there is no MAPQ exclusion threshold.
 
-Paired inputs must be named `<sample>_R1.fastq[.gz]` and `<sample>_R2.fastq[.gz]`, optionally with a matching suffix such as `_R1_001`. Mates remain together during trimming and sampling. Alignment uses `--no-mixed --no-discordant`: only concordant pairs are assigned, and the remaining complete pairs pass to the next stage. **One pair is one observation** in the CSVs. Single-end files contribute one observation per read.
+Paired inputs must be named `<sample>_R1.fastq[.gz]` and `<sample>_R2.fastq[.gz]`, optionally with a matching suffix such as `_R1_001`. Mates remain together during trimming and sampling. Alignment uses `--no-mixed --no-discordant`: only concordant pairs are assigned, and the remaining complete pairs pass to the next stage. **One pair is one observation** in the CSVs. Unpaired inputs are rejected.
 
 The mutually exclusive categories within each organism are:
 
@@ -136,9 +135,35 @@ The mutually exclusive categories within each organism are:
 
 For a pair, overlaps from both sequenced mates are considered together. Gaps in spliced alignments and unsequenced space between mates do not count as overlap. If multiple categories overlap, the priority above chooses exactly one; annotation ambiguity does not inflate totals. Generic genomic `gene` or whole-transcript spans do not label introns as RNA.
 
-`COUNT_STRAND="forward"` preserves the previous featureCounts `-s 1` behavior: read 1 must match the annotated strand. Use `reverse` for reverse-stranded libraries (`-s 2`) or `unstranded` (`-s 0`). Choose this for your library preparation; antisense alignments without eligible annotations are reported as intergenic/unannotated for the selected strand.
+SureSelect Max RNA libraries use dUTP second-strand marking: **R1 is antisense and R2 is sense** (G9689-90000, p. 32). `COUNT_STRAND="reverse"` is fixed; other values are rejected. All nonempty libraries use featureCounts **`-s 2 -p --countReadPairs -B -C`**. Header-only residual libraries get explicit zero columns; when every library is empty, an annotation-only featureCounts call retains `-s 2` and omits pairedness detection because no alignment records exist. No single-end reads are accepted. Category assignment and feature-position profiles use the same R1-antisense orientation.
 
 Gene-level featureCounts tables remain available for CDS and rRNA in each RNA/DNA coordinate system when that annotation type exists. The exclusive category totals come from aligned-block classification, so they are not obtained by summing potentially overlapping gene counts.
+
+## SureSelect Max MBC handling
+
+The attached **G9689-90000**, pp. 28, 31–32, and **G9664-90000**, p. 32 (library composition), describe dual inline MBCs. On **each** mate the first three bases are the molecular barcode and the next two are dark bases. The manuals are kit references; the processing choices below implement the requested workflow.
+
+```bash
+MBC_MODE="strip"   # default: remove MBC/dark cycles, count read pairs
+MBC_INPUT="raw"    # both mates retain all five leading cycles
+```
+
+`strip` removes exactly five leading bases from each mate **before** adapter trimming and minimum-length filtering. No PCR duplicate removal is applied; standard reports and gene tables count read pairs. Use a new `OUTPUT_DIR` when switching from count mode back to strip mode; reusing a directory containing prior molecule tables is rejected to prevent stale results being mistaken for current counts. If demultiplexing already removed all five cycles, set `MBC_INPUT="trimmed"` to avoid trimming insert sequence twice. Raw inputs remain unchanged. Paired FASTQ identifiers, record lengths, and mate counts are validated.
+
+For short inserts, read-through can include the opposite end's MBC/dark bases. The default Illumina adapter sequences replace the old Nextera-style adapters. Cutadapt matches **five wildcard bases plus the adapter** and removes both, requiring at least eight actual adapter bases. This guards against treating an arbitrary five-base sequence as adapter. Adapter-free opposite-end tails or shorter partial adapter matches cannot be resolved reliably by this conservative adapter match; verify trimming on real sequencing QC, as the manual recommends (G9689-90000, p. 45). The adapter settings contain the Illumina sequence only; do not add the five wildcards yourself.
+
+To also estimate captured molecules:
+
+```bash
+MBC_MODE="count"
+MBC_INPUT="raw"
+```
+
+Count mode retains the first three bases and their qualities from **both** mates in a shared read-name suffix through alignment, discards the two dark bases, then groups proper primary pairs by **ordered dual MBC, reference, orientation, and both unclipped 5′ fragment endpoints** independently within each sample and alignment stage. Only one representative pair per exact group is counted. Reads sharing a barcode at different positions remain separate. Missing/ambiguous MBCs are rejected rather than silently collapsed, and count mode refuses already trimmed inputs.
+
+The standard reports, coverage, profiles, and featureCounts tables continue to show read-pair counts so read-disposition totals remain conserved. **`molecule_counts/`** contains parallel featureCounts gene tables (`-s 2`) from the deduplicated pairs. Per-stage `.molecules.bam`, `.molecules.categories.json`, and `.mbc_dedup.json` files retain molecule alignments, exclusive categories, and duplicate statistics; per-sample `.mbc_prepare.json` records preprocessing. Slurm finalization merges both read and molecule tables across samples.
+
+These counts estimate distinct captured fragments, not guaranteed original RNA transcript numbers. The two 3-base MBCs have only 4,096 combinations; exact collisions at identical endpoints can undercount, and sequencing errors in barcodes can overcount. Ambiguous alignment placements can also split or merge apparent molecular families. This mode does **not** perform MBC error correction or single-/double-strand consensus calling. It does not claim the fgbio consensus workflow cited as an example in the manual. Sampling, when enabled, estimates molecules only in the sampled pairs; use `SAMPLE_READS="false"` for full-library estimates.
 
 ## Reports and other outputs
 
@@ -150,13 +175,13 @@ Gene-level featureCounts tables remain available for CDS and rRNA in each RNA/DN
 - `bowtie_alignments/leftover/` contains final unmapped `.fastq.gz` reads or mates.
 - `reference_manifest.json` records the discovered references and cache paths. `run_manifest.json` records the exact current-run sample/stage reports. Reporting checks stage-to-stage count conservation and category totals instead of globbing stale stage outputs.
 
-Bacterial RNA and DNA stages retain separate normalized feature-position analyses when suitable CDS or noncoding RNA features exist: `.feature_read_positions.csv`, `.feature_position_bins.csv`, `.feature_position_summary.csv`, `.metagene_*_profile.csv` and PNG plots. Coordinates run from biological 5′ (0%) to 3′ (100%), reversing negative-strand features. Single reads use alignment midpoints; paired profiles use fragment midpoints. Ambiguous overlaps within a feature class are explicitly flagged and excluded from metagene averages. These midpoint profiles are separate from the aligned-base overlap classification used by the disposition table.
+Bacterial RNA and DNA stages retain separate normalized feature-position analyses when suitable CDS or noncoding RNA features exist: `.feature_read_positions.csv`, `.feature_position_bins.csv`, `.feature_position_summary.csv`, `.metagene_*_profile.csv` and PNG plots. Coordinates run from biological 5′ (0%) to 3′ (100%), reversing negative-strand features. Profiles use fragment midpoints. Ambiguous overlaps within a feature class are explicitly flagged and excluded from metagene averages. These midpoint profiles are separate from the aligned-base overlap classification used by the disposition table.
 
 ## Sampling and other settings
 
-`SAMPLE_READS="true"` selects up to `SAMPLE_SIZE` records (default `5000`) using reservoir sampling and `SAMPLE_SEED` (default `1`). Paired files use the same sampled record positions. Temporary samples live under `OUTPUT_DIR/.bacteria_sampled_fastq`; originals are unchanged. CSV totals refer to the selected input observations, not the unsampled source files. Set `false` for full analysis.
+`SAMPLE_READS="true"` selects up to `SAMPLE_SIZE` read pairs (default `5000`) using reservoir sampling and `SAMPLE_SEED` (default `1`). Both mates use the same sampled record positions. Temporary samples live under `OUTPUT_DIR/.bacteria_sampled_fastq`; originals are unchanged. CSV totals refer to the selected input observations, not the unsampled source files. Set `false` for full analysis.
 
-Other settings include `ADAPTER_SINGLE`, `ADAPTER_R1`, `ADAPTER_R2`, `MIN_READ_LENGTH` (default `22`), `THREADS` (default `16`), `GENE_POSITION_BINS` (default `100`), and `METAGENE_MIN_FEATURE_READS` (default `10`). Aggregated metagene profiles average within-feature fractions over features meeting the minimum, rather than pooling raw reads.
+Other settings include `ADAPTER_R1`, `ADAPTER_R2`, `MIN_READ_LENGTH` (default `22`), `THREADS` (default `16`), `GENE_POSITION_BINS` (default `100`), and `METAGENE_MIN_FEATURE_READS` (default `10`). Aggregated metagene profiles average within-feature fractions over features meeting the minimum, rather than pooling raw reads.
 
 ## Tests
 
@@ -166,4 +191,4 @@ With the pipeline environment activated:
 python -m unittest discover -s tests -v
 ```
 
-The suite covers reference discovery and normalization, category assignment, report conservation, and real single-/paired-end pipeline runs on synthetic references. Integration tests require the installed command-line tools and Python dependencies.
+The suite covers reference discovery and normalization, category assignment, report conservation, and real paired-end pipeline runs on synthetic references. Integration tests require the installed command-line tools and Python dependencies.

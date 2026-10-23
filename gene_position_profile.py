@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create strand-aware feature-relative bacterial read/fragment profiles."""
+"""Create reverse-stranded feature-relative bacterial fragment profiles."""
 import argparse, csv, gzip, os, statistics, sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -141,7 +141,7 @@ def plot_profiles(prefix, bins, cds_rows, nc_rows, type_rows):
     if type_rows: ax.legend(); fig.tight_layout(); fig.savefig(prefix+".metagene_non_CDS_by_type.png",dpi=150); plt.close(fig)
 
 def main():
-    p=argparse.ArgumentParser(); p.add_argument("--bam",required=True); p.add_argument("--gff",required=True); p.add_argument("--gene-id",required=True); p.add_argument("--bins",type=int,default=100); p.add_argument("--min-feature-reads",type=int,default=10); p.add_argument("--output-prefix",required=True); p.add_argument("--paired",action="store_true"); a=p.parse_args()
+    p=argparse.ArgumentParser(); p.add_argument("--bam",required=True); p.add_argument("--gff",required=True); p.add_argument("--gene-id",required=True); p.add_argument("--bins",type=int,default=100); p.add_argument("--min-feature-reads",type=int,default=10); p.add_argument("--output-prefix",required=True); a=p.parse_args()
     for path,label in ((a.bam,"BAM"),(a.gff,"GFF")):
         if not os.path.isfile(path): p.error(f"{label} is missing: {path}")
     if not (os.path.isfile(a.bam+".bai") or os.path.isfile(os.path.splitext(a.bam)[0]+".bai")): p.error(f"BAM index is missing for {a.bam}")
@@ -154,13 +154,13 @@ def main():
     counts={f:[0]*a.bins for f in features}; unique=Counter(); ambiguous=Counter(); type_unique=Counter(); total=outside=0; detail=[]
     for read in bam.fetch(until_eof=True):
         if read.is_unmapped or read.is_secondary or read.is_supplementary: continue
-        if a.paired:
-            if not read.is_paired or not read.is_read1 or read.mate_is_unmapped or read.next_reference_id!=read.reference_id or read.template_length==0: continue
-            left=min(read.reference_start,read.next_reference_start); right=left+abs(read.template_length); midpoint=(left+right)/2; ident=read.query_name
-        else:
-            if read.reference_end is None: continue
-            midpoint=(read.reference_start+read.reference_end)/2; ident=read.query_name
-        total+=1; hits=[f for f in by_ref[read.reference_name] if f.start<=midpoint<f.end]
+        if not read.is_paired:
+            raise SystemExit(f"ERROR: unpaired alignment in paired-end input: {read.query_name}")
+        if not read.is_proper_pair or not read.is_read1 or read.mate_is_unmapped or read.next_reference_id!=read.reference_id or read.template_length==0: continue
+        left=min(read.reference_start,read.next_reference_start); right=left+abs(read.template_length); midpoint=(left+right)/2; ident=read.query_name
+        # R1 is antisense; only features on the opposite strand are eligible.
+        transcript_strand = "+" if read.is_reverse else "-"
+        total+=1; hits=[f for f in by_ref[read.reference_name] if f.strand==transcript_strand and f.start<=midpoint<f.end]
         any_hit=False
         for cls in ("CDS","non_CDS"):
             match=[f for f in hits if f.cls==cls]
@@ -173,7 +173,7 @@ def main():
                 for f in match: detail.append([sample,f.id,f.name,f.type,f.cls,f.ref,f.start+1,f.end,f.strand,ident,midpoint,"",read.mapping_quality,"ambiguous_excluded"])
         if not any_hit: outside+=1
     bam.close()
-    write_csv(a.output_prefix+".feature_read_positions.csv",["sample","feature_id","feature_name","feature_type","feature_class","reference","feature_start","feature_end","strand","read_or_fragment_id","alignment_midpoint","position_percent","mapping_quality","assignment_status"],detail)
+    write_csv(a.output_prefix+".feature_read_positions.csv",["sample","feature_id","feature_name","feature_type","feature_class","reference","feature_start","feature_end","strand","fragment_id","alignment_midpoint","position_percent","mapping_quality","assignment_status"],detail)
     binrows=[]
     for f in features:
         n=sum(counts[f])
@@ -183,7 +183,7 @@ def main():
     header=["sample","feature_class","bin","bin_start_percent","bin_end_percent","mean_fraction","median_fraction","features_contributing","raw_read_count"]
     write_csv(a.output_prefix+".metagene_CDS_profile.csv",header,cds); write_csv(a.output_prefix+".metagene_non_CDS_profile.csv",header,nc)
     write_csv(a.output_prefix+".metagene_non_CDS_by_type.csv",["sample","feature_type"]+header[2:],types)
-    summary=[["total_mapped_reads_or_fragments_examined",total],["reads_or_fragments_outside_all_analyzed_features",outside]]
+    summary=[["total_mapped_fragments_examined",total],["fragments_outside_all_analyzed_features",outside]]
     for cls in ("CDS","non_CDS"):
         fs=[f for f in features if f.cls==cls]; summary += [[f"{cls}.uniquely_assigned",unique[cls]],[f"{cls}.ambiguous",ambiguous[cls]],[f"{cls}.features_with_reads",sum(sum(counts[f])>0 for f in fs)],[f"{cls}.features_in_metagene",sum(sum(counts[f])>=a.min_feature_reads for f in fs)]]
     for typ in sorted({subtype(f.type) for f in features if f.cls == "non_CDS"}):

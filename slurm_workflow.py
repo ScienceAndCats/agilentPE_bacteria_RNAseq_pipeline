@@ -21,22 +21,23 @@ from merge_featurecounts import merge_featurecounts
 
 REPOSITORY = Path(__file__).resolve().parent
 SETTINGS = (
-    'FASTQ_DIR', 'FASTQ_GLOB', 'READ_LAYOUT', 'OUTPUT_DIR', 'MAX_SAMPLES',
+    'FASTQ_DIR', 'FASTQ_GLOB', 'OUTPUT_DIR', 'MAX_SAMPLES',
     'ARRAY_CONCURRENCY', 'THREADS', 'REFERENCE_CACHE_DIR', 'CONDA_SH', 'CONDA_ENV',
     'SLURM_ACCOUNT', 'SLURM_MAIL_USER',
     'DECOY_REFERENCE_DIR', 'BACTERIA_REFERENCE_DIR', 'HOST_REFERENCE_DIR',
-    'ADAPTER_SINGLE', 'ADAPTER_R1', 'ADAPTER_R2', 'ADAPTER_SEQUENCE',
+    'ADAPTER_R1', 'ADAPTER_R2',
     'MIN_READ_LENGTH', 'SAMPLE_READS', 'SAMPLE_SIZE', 'SAMPLE_SEED',
     'GENE_POSITION_BINS', 'METAGENE_MIN_FEATURE_READS', 'COUNT_STRAND',
-    'CSV_CONVERSION_SCRIPT',
+    'CSV_CONVERSION_SCRIPT', 'MBC_MODE', 'MBC_INPUT',
 )
 DEFAULTS = {
-    'FASTQ_DIR': '.', 'FASTQ_GLOB': '*.fastq*', 'READ_LAYOUT': 'single',
+    'FASTQ_DIR': '.', 'FASTQ_GLOB': '*.fastq*',
     'OUTPUT_DIR': '.', 'MAX_SAMPLES': '40', 'ARRAY_CONCURRENCY': '8',
     'SLURM_ACCOUNT': '', 'SLURM_MAIL_USER': '',
     'THREADS': '16', 'REFERENCE_CACHE_DIR': '', 'CONDA_SH': '',
     'CONDA_ENV': 'bacteria-RNAseq-pipeline', 'HOST_REFERENCE_DIR': '',
     'CSV_CONVERSION_SCRIPT': 'bacteria_with_decoys_csvConversion.py',
+    'COUNT_STRAND': 'reverse', 'MBC_MODE': 'strip', 'MBC_INPUT': 'raw',
 }
 
 
@@ -72,6 +73,14 @@ def create_plan(config, base_dir, environment=None):
     settings = {key: environment[key] for key in SETTINGS if key in environment}
     for key, value in DEFAULTS.items():
         settings.setdefault(key, value)
+    if settings['COUNT_STRAND'] != 'reverse':
+        raise ValueError('COUNT_STRAND must be reverse: R1 is antisense and R2 is sense')
+    if settings['MBC_MODE'] not in ('strip', 'count'):
+        raise ValueError('MBC_MODE must be strip or count')
+    if settings['MBC_INPUT'] not in ('raw', 'trimmed'):
+        raise ValueError('MBC_INPUT must be raw or trimmed')
+    if settings['MBC_MODE'] == 'count' and settings['MBC_INPUT'] == 'trimmed':
+        raise ValueError('MBC counting requires raw inline MBC bases; MBC_INPUT=trimmed cannot be counted')
     maximum = positive_integer(settings['MAX_SAMPLES'], 'MAX_SAMPLES')
     concurrency = positive_integer(settings['ARRAY_CONCURRENCY'], 'ARRAY_CONCURRENCY')
     threads = positive_integer(settings['THREADS'], 'THREADS')
@@ -89,7 +98,7 @@ def create_plan(config, base_dir, environment=None):
     settings['CSV_CONVERSION_SCRIPT'] = str(absolute_path(settings['CSV_CONVERSION_SCRIPT'], REPOSITORY))
     if not Path(settings['CSV_CONVERSION_SCRIPT']).is_file():
         raise ValueError(f'CSV_CONVERSION_SCRIPT does not exist: {settings["CSV_CONVERSION_SCRIPT"]}')
-    manifest = build_manifest(settings['FASTQ_DIR'], settings['FASTQ_GLOB'], settings['READ_LAYOUT'], max_samples=maximum)
+    manifest = build_manifest(settings['FASTQ_DIR'], settings['FASTQ_GLOB'], max_samples=maximum)
     output = Path(settings['OUTPUT_DIR'])
     run_id = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + uuid.uuid4().hex[:10]
     run_dir = output / 'slurm_runs' / run_id
@@ -118,6 +127,7 @@ def create_plan(config, base_dir, environment=None):
         'prepare_config': str(prepare_config), 'sample_manifest': str(sample_manifest),
         'reference_manifest': str(run_dir / 'reference_manifest.json'),
         'read_layout': manifest['read_layout'], 'samples': samples,
+        'mbc': {'mode': settings['MBC_MODE'], 'input': settings['MBC_INPUT']},
         'threads': threads, 'array_concurrency': concurrency, 'max_samples': maximum,
         'slurm_account': settings['SLURM_ACCOUNT'],
         'slurm_mail_user': settings['SLURM_MAIL_USER'],
@@ -207,8 +217,10 @@ def collect_samples(plan):
     for index, sample in enumerate(plan['samples']):
         directory = Path(sample['output_dir'])
         worker = json.loads((directory / 'run_manifest.json').read_text())
-        if worker.get('read_layout') != plan['read_layout']:
+        if worker.get('read_layout') != 'paired' or plan.get('read_layout') != 'paired':
             raise ValueError(f'Read layout mismatch for {sample["sample"]}')
+        if worker.get('mbc') != plan.get('mbc'):
+            raise ValueError(f'MBC settings mismatch for {sample["sample"]}')
         if worker.get('sample_index') != index or worker.get('input_sample_manifest') != plan['sample_manifest']:
             raise ValueError(f'Array manifest provenance mismatch for {sample["sample"]}')
         entries = worker.get('samples', [])
@@ -216,21 +228,27 @@ def collect_samples(plan):
             raise ValueError(f'Missing, duplicate, or unexpected sample in worker {index}')
         entry = dict(entries[0])
         entry['cutadapt_log'] = required_file(entry.get('cutadapt_log'), directory, 'cutadapt log')
+        entry['mbc_prepare'] = required_file(entry.get('mbc_prepare'), directory, 'MBC preparation report')
         stages = [dict(stage) for stage in entry.get('stages', [])]
         if [stage.get('name') for stage in stages] != expected:
             raise ValueError(f'Incomplete or unexpected stages for {sample["sample"]}')
         for stage in stages:
             stage['log'] = required_file(stage.get('log'), directory, 'Bowtie2 log')
+            if plan['mbc']['mode'] == 'count':
+                stage['molecules'] = required_file(stage.get('molecules'), directory, 'deduplicated molecule BAM')
+                stage['mbc_stats'] = required_file(stage.get('mbc_stats'), directory, 'MBC deduplication report')
+                if stage.get('organism') != 'decoy':
+                    stage['molecule_categories'] = required_file(stage.get('molecule_categories'), directory, 'molecule category report')
             if stage.get('organism') != 'decoy':
                 stage['categories'] = required_file(stage.get('categories'), directory, 'category report')
                 stage['coverage'] = required_file(stage.get('coverage'), directory, 'coverage report')
         entry['stages'] = stages
         leftovers = entry.get('leftover', [])
-        if len(leftovers) != (2 if plan['read_layout'] == 'paired' else 1):
+        if len(leftovers) != 2:
             raise ValueError(f'Incomplete leftover FASTQs for {sample["sample"]}')
         entry['leftover'] = [required_file(path, directory, 'leftover FASTQ') for path in leftovers]
         combined.append(entry)
-    return {'read_layout': plan['read_layout'], 'slurm_run_id': plan['run_id'], 'samples': combined}
+    return {'read_layout': 'paired', 'mbc': plan['mbc'], 'slurm_run_id': plan['run_id'], 'samples': combined}
 
 
 def validate_gene_tables(plan):
@@ -262,8 +280,12 @@ def validate_gene_tables(plan):
                 expected.extend((table, Path(str(table) + '.summary')))
     for sample in plan['samples']:
         directory = Path(sample['output_dir'])
-        for relative in expected:
-            required_file(str(relative), directory, f'featureCounts output for {sample["sample"]}')
+        roots = [directory]
+        if plan.get('mbc', {}).get('mode') == 'count':
+            roots.append(directory / 'molecule_counts')
+        for root in roots:
+            for relative in expected:
+                required_file(str(relative), root, f'featureCounts output for {sample["sample"]}')
 
 
 
@@ -290,6 +312,9 @@ def finalize(plan):
             shutil.copyfile(staging / 'output_read_breakdown.csv', staging / alias_name)
             shutil.copyfile(plan['reference_manifest'], staging / 'reference_manifest.json')
             gene_tables = merge_featurecounts([Path(sample['output_dir']) for sample in plan['samples']], staging)
+            if plan.get('mbc', {}).get('mode') == 'count':
+                molecule_tables = merge_featurecounts([Path(sample['output_dir']) / 'molecule_counts' for sample in plan['samples']], staging / 'molecule_counts')
+                gene_tables.extend(molecule_tables)
             names = [summary_name, 'output_read_breakdown.csv', alias_name, 'reference_manifest.json']
             names += [str(path.relative_to(staging)) for path in gene_tables]
             names.append('run_manifest.json')
