@@ -327,9 +327,7 @@ for stage in "${!stage_names[@]}"; do
         molecule_output="$molecule_dir/$(basename "$count_output")"
         python3 "$SCRIPT_DIR/paired_featurecounts.py" --threads "$THREADS" --gff "${stage_gffs[$stage]}" --feature "$feature" \
           --output "$molecule_output" "${molecule_files[@]}"
-        if [[ "$feature" == CDS ]]; then sed 's/\t/,/g' "$molecule_output" > "${molecule_output%.txt}.csv"; fi
       fi
-      if [[ "$feature" == CDS ]]; then sed 's/\t/,/g' "$count_output" > "${count_output%.txt}.csv"; fi
     fi
   done
 done

@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from merge_featurecounts import ANNOTATION_COLUMNS, TABLE_PATHS, merge_featurecounts
+from featurecounts_io import MAX_LINE_BYTES, open_table
 
 
 class MergeFeatureCountsTests(unittest.TestCase):
@@ -38,9 +39,10 @@ class MergeFeatureCountsTests(unittest.TestCase):
             Path(str(path) + '.summary').write_text(f'Status\t{sam}\nAssigned\t{sum(counts)}\nUnassigned_Unmapped\t7\n')
         return path
 
-    def read_rows(self, path, delimiter='\t'):
-        with path.open(newline='') as handle:
-            return list(csv.reader((line for line in handle if not line.startswith('#')), delimiter=delimiter))
+    def read_rows(self, path):
+        columns = ('Status',) if str(path).endswith('.summary') else ANNOTATION_COLUMNS
+        with open_table(path, columns) as rows:
+            return list(rows)
 
     def test_combines_all_stage_matrices_and_summaries_in_sample_order(self):
         originals = {}
@@ -49,7 +51,7 @@ class MergeFeatureCountsTests(unittest.TestCase):
                 path = self.table(directory, relative, counts=(i + 1, i * 3))
                 originals[path] = path.read_bytes()
         generated = merge_featurecounts(self.samples, self.output)
-        self.assertEqual(len(generated), 20)  # 8 matrices, 8 summaries, 4 CDS CSVs
+        self.assertEqual(len(generated), 16)  # 8 native TSV matrices and 8 assignment summaries
         self.assertTrue(all(path.is_absolute() and path.is_file() for path in generated))
         for relative in TABLE_PATHS:
             rows = self.read_rows(self.output / relative)
@@ -61,7 +63,7 @@ class MergeFeatureCountsTests(unittest.TestCase):
             self.assertEqual(summary[0], ['Status', *rows[0][6:]])
             self.assertEqual(summary[1], ['Assigned', '1', '5'])
             if relative.name.endswith('_summary.txt'):
-                self.assertEqual(self.read_rows((self.output / relative).with_suffix('.csv'), ','), rows)
+                self.assertFalse((self.output / relative).with_suffix('.csv').exists())
         for path, content in originals.items():
             self.assertEqual(path.read_bytes(), content)
 
@@ -70,7 +72,7 @@ class MergeFeatureCountsTests(unittest.TestCase):
         for directory in self.samples:
             self.table(directory, summary=False)
         generated = merge_featurecounts(self.samples, self.output)
-        self.assertEqual({path.name for path in generated}, {'featurecounts_BACTERIA_summary.txt', 'featurecounts_BACTERIA_summary.csv'})
+        self.assertEqual({path.name for path in generated}, {'featurecounts_BACTERIA_summary.txt'})
 
     def test_partial_stage_or_summary_is_rejected_before_output(self):
         self.table(self.samples[0])
@@ -159,6 +161,36 @@ class MergeFeatureCountsTests(unittest.TestCase):
         rows = self.read_rows(self.output / TABLE_PATHS[0])
         self.assertEqual(rows[1][6:], [str(i) for i in range(40)])
         self.assertEqual(rows[2][6:], [str(40 - i) for i in range(40)])
+
+    def test_long_human_annotation_survives_merge_without_csv_or_global_limit_change(self):
+        limit = csv.field_size_limit()
+        annotation = ';'.join(['chr1'] * 40000)
+        for index, directory in enumerate(self.samples):
+            self.table(directory, counts=(index + 2,),
+                       annotations=[('gene', annotation, '1', '100', '+', '100')])
+        generated = merge_featurecounts(self.samples, self.output)
+        row = self.read_rows(self.output / TABLE_PATHS[0])[1]
+        self.assertEqual(row, ['gene', annotation, '1', '100', '+', '100', '2', '3'])
+        self.assertEqual(csv.field_size_limit(), limit)
+        self.assertTrue(all(path.suffix in ('.txt', '.summary') for path in generated))
+        self.assertFalse(list(self.output.rglob('*.csv')))
+
+    def test_oversized_data_or_comment_preserves_existing_matrix(self):
+        for directory in self.samples:
+            self.table(directory)
+        self.output.mkdir()
+        target = self.output / TABLE_PATHS[0]
+        target.write_text('previous successful matrix\n')
+        source = self.samples[1] / TABLE_PATHS[0]
+        original = source.read_bytes()
+        for oversized in (b'#' + b'x' * MAX_LINE_BYTES,
+                          original + b'gene\t' + b'x' * MAX_LINE_BYTES):
+            with self.subTest(comment=oversized.startswith(b'#x')):
+                source.write_bytes(oversized)
+                with self.assertRaisesRegex(ValueError, 'line exceeds'):
+                    merge_featurecounts(self.samples, self.output)
+                self.assertEqual(target.read_text(), 'previous successful matrix\n')
+                self.assertEqual(list(self.output.iterdir()), [target])
 
 
 if __name__ == '__main__':

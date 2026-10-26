@@ -10,15 +10,13 @@ are processed in this annotation-only invocation. No artificial reads are added.
 """
 
 import argparse
-import csv
 from pathlib import Path
 import subprocess
 import tempfile
 
 import pysam
 
-
-ANNOTATION_COLUMNS = ('Geneid', 'Chr', 'Start', 'End', 'Strand', 'Length')
+from featurecounts_io import ANNOTATION_COLUMNS, leading_comments, open_table, write_row
 
 
 def contains_pairs(path):
@@ -36,24 +34,16 @@ def contains_pairs(path):
 def add_zero_columns(source, destination, inputs, counted, annotation_columns):
     """Preserve featureCounts annotation rows and insert empty-library columns."""
     positions = {name: index for index, name in enumerate(counted)}
-    with source.open(newline='') as reader_handle, destination.open('w', newline='') as writer_handle:
-        for line in reader_handle:
-            if line.startswith('#'):
-                writer_handle.write(line)
-            else:
-                header = next(csv.reader([line], delimiter='\t'))
-                break
-        else:
-            raise ValueError(f'featureCounts produced no table header: {source}')
+    with open_table(source, annotation_columns) as rows, destination.open('w', encoding='utf-8', newline='') as writer_handle:
+        header = next(rows)
         if header[:len(annotation_columns)] != list(annotation_columns) or header[len(annotation_columns):] != counted:
             raise ValueError(f'Unexpected featureCounts output columns in {source}')
-        writer = csv.writer(writer_handle, delimiter='\t', lineterminator='\n')
-        writer.writerow((*annotation_columns, *inputs))
-        for row in csv.reader(reader_handle, delimiter='\t'):
-            if len(row) != len(annotation_columns) + len(counted):
-                raise ValueError(f'Unexpected featureCounts output row in {source}')
+        for comment in leading_comments(source):
+            writer_handle.write(comment)
+        write_row(writer_handle, (*annotation_columns, *inputs))
+        for row in rows:
             values = row[len(annotation_columns):]
-            writer.writerow((*row[:len(annotation_columns)], *(values[positions[name]] if name in positions else '0' for name in inputs)))
+            write_row(writer_handle, (*row[:len(annotation_columns)], *(values[positions[name]] if name in positions else '0' for name in inputs)))
 
 
 def count_features(gff, feature, output, threads, inputs):

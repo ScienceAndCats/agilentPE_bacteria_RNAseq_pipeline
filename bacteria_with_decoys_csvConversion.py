@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 
 from read_breakdown_csv import build_table, read_manifest, report_path
+from featurecounts_io import open_table
 
 
 HEADER = (
@@ -38,18 +39,21 @@ def coverage_metrics(path):
 
 def legacy_feature_counts(output_dir):
     path = output_dir / "featurecounts_BACTERIA_summary.txt"
-    with path.open() as handle:
-        rows = list(csv.reader((line for line in handle if not line.startswith("#")), delimiter="\t"))
-    if not rows or len(rows[0]) < 7:
-        raise ValueError(f"Unexpected featureCounts format: {path}")
-    result = {}
-    for column, sam in enumerate(rows[0][6:], 6):
-        match = re.fullmatch(r"BACTERIA_(.+)_\d+bp\.sam", Path(sam).name)
-        if not match:
-            raise ValueError(f"Unexpected alignment name: {sam}")
-        values = [int(row[column]) for row in rows[1:]]
-        result[match.group(1)] = sum(values), sum(value > 0 for value in values)
-    return result
+    with open_table(path) as rows:
+        header = next(rows)
+        names = []
+        for sam in header[6:]:
+            match = re.fullmatch(r"BACTERIA_(.+)_\d+bp\.sam", Path(sam).name)
+            if not match:
+                raise ValueError(f"Unexpected alignment name: {sam}")
+            names.append(match.group(1))
+        totals, expressed = [0] * len(names), [0] * len(names)
+        for row in rows:
+            for column, value in enumerate(row[6:]):
+                count = int(value)
+                totals[column] += count
+                expressed[column] += count > 0
+    return {name: (total, genes) for name, total, genes in zip(names, totals, expressed)}
 
 
 def summary_rows(output_dir):
