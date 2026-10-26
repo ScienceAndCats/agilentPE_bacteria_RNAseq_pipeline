@@ -9,7 +9,35 @@ from unittest.mock import patch
 
 import pysam
 
-from paired_featurecounts import count_features
+from paired_featurecounts import add_zero_columns, count_features
+from featurecounts_io import ANNOTATION_COLUMNS, open_table
+
+
+class FeatureCountsPostprocessingTests(unittest.TestCase):
+    def test_long_fields_and_quotes_survive_zero_column_insertion(self):
+        limit = csv.field_size_limit()
+        with tempfile.TemporaryDirectory() as temporary:
+            source, output = Path(temporary) / 'source.txt', Path(temporary) / 'final.txt'
+            annotation = ';'.join(['chr1'] * 40000)
+            source.write_text('# provenance\n' + '\t'.join((*ANNOTATION_COLUMNS, 'reads.sam')) +
+                              f'\ngene"quoted,\t{annotation}\t1\t20\t+\t20\t7\n')
+            add_zero_columns(source, output, ['empty.bam', 'reads.sam'], ['reads.sam'], ANNOTATION_COLUMNS)
+            with open_table(output) as rows:
+                header, row = list(rows)
+            self.assertEqual(header[6:], ['empty.bam', 'reads.sam'])
+            self.assertEqual(row, ['gene"quoted,', annotation, '1', '20', '+', '20', '0', '7'])
+            self.assertTrue(output.read_text().startswith('# provenance\n'))
+        self.assertEqual(csv.field_size_limit(), limit)
+
+    def test_invalid_counts_and_columns_are_rejected_during_postprocessing(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source, output = Path(temporary) / 'source.txt', Path(temporary) / 'final.txt'
+            header = '\t'.join((*ANNOTATION_COLUMNS, 'reads.sam')) + '\n'
+            for row in ('gene\tchr1\t1\t20\t+\t20\t-1\n',
+                        'gene\tchr1\t1\t20\t+\t20\t3\textra\n'):
+                source.write_text(header + row)
+                with self.assertRaises(ValueError):
+                    add_zero_columns(source, output, ['reads.sam'], ['reads.sam'], ANNOTATION_COLUMNS)
 
 
 @unittest.skipUnless(shutil.which('featureCounts'), 'featureCounts is required')
@@ -88,6 +116,21 @@ class PairedFeatureCountsTests(unittest.TestCase):
             count_features(self.gff, 'CDS', self.output, 1, [self.pairs])
         run.assert_not_called()
         self.assertFalse(self.output.exists())
+
+    def test_real_featurecounts_with_many_exons_exceeds_old_csv_field_limit(self):
+        self.gff.write_text(''.join(
+            f'chr\ttest\tCDS\t{2*i+1}\t{2*i+1}\t.\t+\t.\tlocus_tag=large_gene\n'
+            for i in range(30000)))
+        actual_run = subprocess.run
+        def run(command, **kwargs):
+            return actual_run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, **kwargs)
+        with patch('paired_featurecounts.subprocess.run', side_effect=run):
+            count_features(self.gff, 'CDS', self.output, 1, [self.empty_sam, self.empty_bam])
+        with open_table(self.output) as rows:
+            header, row = list(rows)
+        self.assertEqual(header[6:], [str(self.empty_sam), str(self.empty_bam)])
+        self.assertGreater(max(map(len, row[:6])), 131072)
+        self.assertEqual(row[5:], ['30000', '0', '0'])
 
 
 if __name__ == '__main__':

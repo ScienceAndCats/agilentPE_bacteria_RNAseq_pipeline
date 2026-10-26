@@ -160,6 +160,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         self.assertTrue((output / f"BACTERIA_{output.name}.csv").exists())
         self.assertEqual((output / "output_read_breakdown.csv").read_bytes(), (output / f"BACTERIA_{output.name}_read_breakdown.csv").read_bytes())
         self.assertTrue((output / "featurecounts_BACTERIA_summary.txt").exists())
+        self.assertFalse(list(output.rglob("featurecounts_*.csv")))
         self.assertTrue(list(output.glob("bowtie_alignments/bacteria/rna/*.metagene_CDS_profile.png")))
         manifest = json.loads((output / "reference_manifest.json").read_text())
         self.assertEqual(manifest["decoy"]["index"], str(self.references / "decoy/Gina_Pangenome"))
@@ -234,7 +235,17 @@ class PipelineIntegrationTests(unittest.TestCase):
             self.assertEqual([entry["sample"] for entry in manifest["samples"]], [sample["sample"]])
             self.assertFalse((worker_output / "output_read_breakdown.csv").exists())
             self.assertFalse((worker_output / f"BACTERIA_{worker_output.name}.csv").exists())
+        # A prior successful finalizer may have published the old CSV gene
+        # companions. Retire only those tracked generated files, preserving
+        # unrelated user CSVs and the read-breakdown output.
+        obsolete = output / 'featurecounts_BACTERIA_summary.csv'
+        obsolete.write_text('old generated gene table\n')
+        user_csv = output / 'user_notes.csv'
+        user_csv.write_text('keep this user file\n')
+        (output / '.slurm_published_files.json').write_text(json.dumps({'files': [obsolete.name]}))
         stage("finalize")
+        self.assertFalse(obsolete.exists())
+        self.assertEqual(user_csv.read_text(), 'keep this user file\n')
         with (output / "output_read_breakdown.csv").open() as handle:
             rows = list(csv.DictReader(handle))
         self.assertEqual([row["Sample"] for row in rows], names)
@@ -246,7 +257,7 @@ class PipelineIntegrationTests(unittest.TestCase):
         combined = json.loads((output / "run_manifest.json").read_text())
         self.assertEqual([entry["sample"] for entry in combined["samples"]], names)
         # Every stage's gene matrix keeps both sample columns, including the
-        # historical CSV companion and featureCounts assignment summary.
+        # native TSV matrix and featureCounts assignment summary.
         merged_files = []
         for relative, organism in ((Path("."), "BACTERIA"), (Path("bowtie_alignments/bacteria/rna"), "BACTERIA"), (Path("bowtie_alignments/host"), "HOST"), (Path("bowtie_alignments/host/rna"), "HOST")):
             for feature in ("summary", "rRNA"):
@@ -268,10 +279,8 @@ class PipelineIntegrationTests(unittest.TestCase):
                 merged_files.extend([table, summary])
                 if feature == "summary":
                     csv_table = table.with_suffix(".csv")
-                    with csv_table.open() as handle:
-                        csv_rows = list(csv.reader(line for line in handle if not line.startswith("#")))
-                    self.assertEqual(csv_rows, matrix)
-                    merged_files.append(csv_table)
+                    self.assertFalse(csv_table.exists())
+        self.assertFalse(list(output.rglob("featurecounts_*.csv")))
         if mbc_mode == "count":
             for table in merged_files:
                 if table.suffix == ".txt" and not str(table).endswith(".summary"):

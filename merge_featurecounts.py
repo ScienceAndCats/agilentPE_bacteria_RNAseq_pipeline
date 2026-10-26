@@ -8,15 +8,12 @@ all project reports have been validated.
 """
 
 import argparse
-import csv
 from contextlib import ExitStack
 from itertools import zip_longest
 from pathlib import Path
-import re
 import tempfile
 
-
-ANNOTATION_COLUMNS = ("Geneid", "Chr", "Start", "End", "Strand", "Length")
+from featurecounts_io import ANNOTATION_COLUMNS, open_table, write_row
 STAGES = (
     (Path("."), "BACTERIA"),
     (Path("bowtie_alignments/bacteria/rna"), "BACTERIA"),
@@ -31,20 +28,10 @@ TABLE_PATHS = tuple(
 MERGE_COMMENT = "# Merged featureCounts tables; sample columns follow input directory order.\n"
 
 
-def _rows(handle):
-    return csv.reader((line for line in handle if not line.startswith("#") and line.strip()), delimiter="\t")
-
-
-def _count(value, path, row_number):
-    if re.fullmatch(r"\d+", value) is None:
-        raise ValueError(f"Invalid featureCounts count in {path}, row {row_number}: {value!r}")
-    return value
-
-
 def _merge_matrix(sources, destination):
     """Stream corresponding rows from one open file per sample."""
     with ExitStack() as stack:
-        readers = [_rows(stack.enter_context(path.open(newline=""))) for path in sources]
+        readers = [stack.enter_context(open_table(path)) for path in sources]
         headers = [next(reader, None) for reader in readers]
         for path, header in zip(sources, headers):
             if header is None or len(header) != 7 or tuple(header[:6]) != ANNOTATION_COLUMNS or not header[6]:
@@ -53,23 +40,21 @@ def _merge_matrix(sources, destination):
         if len(sample_columns) != len(set(sample_columns)):
             raise ValueError(f"Duplicate featureCounts sample columns in {sources}")
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = stack.enter_context(tempfile.NamedTemporaryFile(mode="w", newline="", prefix=f".{destination.name}.", dir=destination.parent, delete=False))
+        temporary = stack.enter_context(tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", prefix=f".{destination.name}.", dir=destination.parent, delete=False))
         temporary_path = Path(temporary.name)
         try:
             temporary.write(MERGE_COMMENT)
-            writer = csv.writer(temporary, delimiter="\t", lineterminator="\n")
-            writer.writerow((*ANNOTATION_COLUMNS, *sample_columns))
+            write_row(temporary, (*ANNOTATION_COLUMNS, *sample_columns))
             for number, rows in enumerate(zip_longest(*readers), 2):
                 if any(row is None for row in rows):
                     raise ValueError(f"Different gene row counts in featureCounts tables: {sources}")
                 for path, row in zip(sources, rows):
                     if len(row) != 7:
                         raise ValueError(f"Expected one sample count in {path}, row {number}")
-                    _count(row[6], path, number)
                 annotation = rows[0][:6]
                 if any(row[:6] != annotation for row in rows[1:]):
                     raise ValueError(f"Mismatched featureCounts annotation at row {number}: {sources}")
-                writer.writerow((*annotation, *(row[6] for row in rows)))
+                write_row(temporary, (*annotation, *(row[6] for row in rows)))
             temporary.flush()
             temporary.close()
             temporary_path.replace(destination)
@@ -81,16 +66,15 @@ def _merge_matrix(sources, destination):
 
 def _merge_summary(sources, destination, expected_columns):
     with ExitStack() as stack:
-        readers = [_rows(stack.enter_context(path.open(newline=""))) for path in sources]
+        readers = [stack.enter_context(open_table(path, ("Status",))) for path in sources]
         for path, reader, sample in zip(sources, readers, expected_columns):
             header = next(reader, None)
             if header != ["Status", sample]:
                 raise ValueError(f"featureCounts summary sample column disagrees with its table: {path}")
-        temporary = stack.enter_context(tempfile.NamedTemporaryFile(mode="w", newline="", prefix=f".{destination.name}.", dir=destination.parent, delete=False))
+        temporary = stack.enter_context(tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", prefix=f".{destination.name}.", dir=destination.parent, delete=False))
         temporary_path = Path(temporary.name)
         try:
-            writer = csv.writer(temporary, delimiter="\t", lineterminator="\n")
-            writer.writerow(("Status", *expected_columns))
+            write_row(temporary, ("Status", *expected_columns))
             seen_statuses = set()
             for number, rows in enumerate(zip_longest(*readers), 2):
                 if any(row is None for row in rows):
@@ -98,12 +82,11 @@ def _merge_summary(sources, destination, expected_columns):
                 for path, row in zip(sources, rows):
                     if len(row) != 2 or not row[0]:
                         raise ValueError(f"Invalid featureCounts status row in {path}, row {number}")
-                    _count(row[1], path, number)
                 status = rows[0][0]
                 if any(row[0] != status for row in rows[1:]) or status in seen_statuses:
                     raise ValueError(f"Mismatched or duplicate featureCounts status at row {number}: {sources}")
                 seen_statuses.add(status)
-                writer.writerow((status, *(row[1] for row in rows)))
+                write_row(temporary, (status, *(row[1] for row in rows)))
             if "Assigned" not in seen_statuses:
                 raise ValueError(f"No Assigned status in featureCounts summaries: {sources}")
             temporary.flush()
@@ -114,19 +97,12 @@ def _merge_summary(sources, destination, expected_columns):
             raise
 
 
-def _write_csv(source, destination):
-    with source.open(newline="") as handle, destination.open("w", newline="") as output:
-        output.write(MERGE_COMMENT)
-        writer = csv.writer(output, lineterminator="\n")
-        writer.writerows(_rows(handle))
-
-
 def merge_featurecounts(sample_directories, destination):
     """Return generated files after merging all available stage/type matrices.
 
     Stage/type tables and their optional .summary files must each be present for
-    every sample or absent for every sample. Sources are never modified. CDS
-    matrices also receive the historical .csv companion; rRNA tables retain TSV.
+    every sample or absent for every sample. Sources are never modified. All
+    matrices and assignment summaries retain native TSV; no CSV is generated.
     """
     directories = [Path(directory).resolve() for directory in sample_directories]
     destination = Path(destination).resolve()
@@ -163,10 +139,6 @@ def merge_featurecounts(sample_directories, destination):
             summary_target = Path(str(target) + ".summary")
             _merge_summary(summary_sources, summary_target, columns)
             generated.append(summary_target)
-        if relative.name.endswith("_summary.txt"):
-            csv_target = target.with_suffix(".csv")
-            _write_csv(target, csv_target)
-            generated.append(csv_target)
     return generated
 
 

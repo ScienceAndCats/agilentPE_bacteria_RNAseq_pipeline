@@ -7,6 +7,7 @@ import json
 import re
 from pathlib import Path
 
+from featurecounts_io import open_table
 
 ATTRIBUTES = (
     "Total reads",
@@ -72,15 +73,14 @@ def sample_from_log(path):
 
 def assigned_by_sample(path, prefix):
     """Read the Assigned row of a featureCounts .summary file."""
-    with path.open(newline="") as handle:
-        rows = list(csv.reader(handle, delimiter="\t"))
-    if not rows or rows[0][0] != "Status":
-        raise ValueError(f"Unexpected featureCounts summary format: {path}")
-    assigned = next((row for row in rows[1:] if row[0] == "Assigned"), None)
-    if assigned is None:
-        raise ValueError(f"No Assigned row in {path}")
+    assigned = None
+    with open_table(path, ("Status",)) as rows:
+        header = next(rows)
+        for row in rows:
+            if row[0] == "Assigned":
+                assigned = row
     result = {}
-    for sam, count in zip(rows[0][1:], assigned[1:]):
+    for sam, count in zip(header[1:], assigned[1:]):
         name = Path(sam).name
         match = re.fullmatch(rf"{prefix}_(.+)_\d+bp\.sam", name)
         if not match:

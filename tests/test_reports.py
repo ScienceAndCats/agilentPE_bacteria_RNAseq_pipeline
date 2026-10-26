@@ -8,8 +8,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from read_breakdown_csv import bowtie_counts, build_table, percentage
-from bacteria_with_decoys_csvConversion import summary_rows
+from read_breakdown_csv import assigned_by_sample, bowtie_counts, build_table, percentage
+from bacteria_with_decoys_csvConversion import legacy_feature_counts, summary_rows
+from featurecounts_io import ANNOTATION_COLUMNS
 
 
 class ReportTests(unittest.TestCase):
@@ -95,6 +96,24 @@ class ReportTests(unittest.TestCase):
             row = list(csv.DictReader(handle))[0]
         self.assertEqual(row['Host CDS (reads)'], '1')
         self.assertEqual(row['Host other RNA (% of total reads)'], '10.00%')
+
+    def test_legacy_gene_summary_streams_long_annotations(self):
+        path = self.output / 'featurecounts_BACTERIA_summary.txt'
+        annotation = ';'.join(['chr1'] * 40000)
+        path.write_text('\t'.join((*ANNOTATION_COLUMNS, 'BACTERIA_sample_22bp.sam')) +
+                        f'\ngene\t{annotation}\t1\t20\t+\t20\t7\n')
+        self.assertEqual(legacy_feature_counts(self.output), {'sample': (7, 1)})
+
+    def test_legacy_assignment_report_rejects_bad_counts_and_row_widths(self):
+        path = self.output / 'counts.summary'
+        header = 'Status\tBACTERIA_sample_22bp.sam\n'
+        path.write_text(header + 'Assigned\t7\nUnassigned_Unmapped\t0\n')
+        self.assertEqual(assigned_by_sample(path, 'BACTERIA'), {'sample': 7})
+        for row in ('Assigned\t-1\n', 'Assigned\t7\textra\n',
+                    'Assigned\t7\nAssigned\t1\n'):
+            path.write_text(header + row)
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                assigned_by_sample(path, 'BACTERIA')
 
     def test_summary_aggregates_rna_dna_and_unique_cds_ids(self):
         self.fixture()
